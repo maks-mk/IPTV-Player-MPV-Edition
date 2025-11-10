@@ -181,24 +181,34 @@ def validate_m3u(content):
     return content and ('#EXTM3U' in content or '#EXTINF' in content)
 
 def parse_m3u_line(line):
-    """Парсинг строки EXTINF"""
+    """Парсинг строки EXTINF (оптимизированный)"""
     current_name = None
     current_group = None
     current_logo = None
 
-    if ',' in line:
-        info_part, current_name = line.split(',', 1)
-        current_name = current_name.strip()
+    # Разделяем на info и name
+    comma_idx = line.find(',')
+    if comma_idx == -1:
+        return current_name, current_group, current_logo
+    
+    info_part = line[:comma_idx]
+    current_name = line[comma_idx + 1:].strip()
 
-        if 'group-title="' in info_part:
-            start = info_part.find('group-title="') + 13
-            end = info_part.find('"', start)
-            current_group = info_part[start:end]
+    # Ищем group-title
+    group_start = info_part.find('group-title="')
+    if group_start != -1:
+        group_start += 13
+        group_end = info_part.find('"', group_start)
+        if group_end != -1:
+            current_group = info_part[group_start:group_end]
 
-        if 'tvg-logo="' in info_part:
-            start = info_part.find('tvg-logo="') + 10
-            end = info_part.find('"', start)
-            current_logo = info_part[start:end]
+    # Ищем tvg-logo
+    logo_start = info_part.find('tvg-logo="')
+    if logo_start != -1:
+        logo_start += 10
+        logo_end = info_part.find('"', logo_start)
+        if logo_end != -1:
+            current_logo = info_part[logo_start:logo_end]
 
     return current_name, current_group, current_logo
 
@@ -417,6 +427,10 @@ class MPVPlayer(QMainWindow):
         # Создаем UI и MPV
         self.init_ui()
         self.init_mpv()
+        
+        # Обновляем состояние чекбокса автообновления после создания UI
+        if hasattr(self, 'auto_update_checkbox'):
+            self.auto_update_checkbox.setChecked(self.auto_update_enabled)
 
         # Инициализация
         self.show()
@@ -448,6 +462,9 @@ class MPVPlayer(QMainWindow):
         self.playlist_files = []
         self.playlists_data = {}
         self.last_playlist = None
+        self.download_thread = None  # Поток загрузки плейлиста
+        self.update_queue = []  # Очередь автообновления плейлистов
+        self.auto_update_enabled = True  # Автообновление по умолчанию включено
 
         # Кэш иконок
         self.channel_icons = {}
@@ -456,6 +473,7 @@ class MPVPlayer(QMainWindow):
         self.icon_stats = {'loaded': 0, 'failed': 0, 'cache': 0}
         self.max_concurrent_downloads = MAX_CONCURRENT_DOWNLOADS
         self._active_threads = []  # Список активных потоков
+        self._fallback_icon = None  # Кэш fallback иконки
 
     def _schedule_initial_load(self):
         """Запланировать загрузку плейлиста после инициализации UI"""
@@ -674,14 +692,22 @@ class MPVPlayer(QMainWindow):
         self.btn_update_playlist = self.create_icon_button(
             'fa5s.sync', '🔄', 'Обновить плейлист', self.on_update_playlist_clicked
         )
-        self.btn_update_playlist.setEnabled(False)
+        self.btn_update_playlist.setEnabled(True)  # Всегда доступна
         playlist_layout.addWidget(self.btn_update_playlist)
 
         self.btn_delete_playlist = self.create_icon_button(
             'fa5s.trash', '🗑', 'Удалить плейлист', self.on_delete_playlist_clicked
         )
-        self.btn_delete_playlist.setEnabled(True)
         playlist_layout.addWidget(self.btn_delete_playlist)
+
+        # Чекбокс автообновления
+        from PySide6.QtWidgets import QCheckBox
+        self.auto_update_checkbox = QCheckBox("Автообновление")
+        self.auto_update_checkbox.setChecked(self.auto_update_enabled)
+        self.auto_update_checkbox.setToolTip("Автоматически обновлять плейлисты при запуске (если не обновлялись более 24 часов)")
+        self.auto_update_checkbox.stateChanged.connect(self.on_auto_update_changed)
+        self.auto_update_checkbox.setStyleSheet(f"color: {COLORS['text']};")
+        playlist_layout.addWidget(self.auto_update_checkbox)
 
         playlist_layout.addStretch()
         layout.addLayout(playlist_layout)
@@ -725,66 +751,15 @@ class MPVPlayer(QMainWindow):
             print("Control panel created successfully")
         except Exception as e:
             print(f"Error creating control panel: {e}")
-            # Fallback на простые кнопки если иконки вызывают проблемы
-            try:
-                self.control_panel = self._create_simple_control_panel()
-                self.right_layout.addWidget(self.control_panel)
-                print("Created simple control panel as fallback")
-            except Exception as e2:
-                print(f"Even fallback failed: {e2}")
-
-    def _create_simple_control_panel(self):
-        """Простая панель управления без qtawesome (fallback)"""
-        panel = QWidget()
-        panel.setStyleSheet("background-color: #2d2d2d; border-radius: 4px;")
-        layout = QHBoxLayout(panel)
-        layout.setContentsMargins(8, 8, 8, 8)
-
-        # Простые текстовые кнопки
-        self.btn_play = QPushButton("▶")
-        self.btn_play.setToolTip("Воспроизвести (Пробел)")
-        self.btn_play.clicked.connect(self.play_selected)
-
-        self.btn_stop = QPushButton("⏹")
-        self.btn_stop.setToolTip("Стоп")
-        self.btn_stop.clicked.connect(self.stop_playback)
-
-        self.btn_fullscreen = QPushButton("⛶")
-        self.btn_fullscreen.setToolTip("Полноэкранный режим (F11 или двойной клик)")
-        self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
-
-        for btn in [self.btn_play, self.btn_stop, self.btn_fullscreen]:
-            btn.setFixedSize(36, 36)
-            layout.addWidget(btn)
-
-        layout.addStretch()
-
-        # Ползунок громкости (простой, без qtawesome)
-        volume_layout = QHBoxLayout()
-        volume_layout.addWidget(QLabel("🔊"))
-        self.volume_slider = QSlider(Qt.Horizontal)
-        self.volume_slider.setMinimum(0)
-        self.volume_slider.setMaximum(100)
-        self.volume_slider.setValue(70)
-        self.volume_slider.setFixedWidth(150)
-        self.volume_slider.setToolTip("Громкость")
-        self.volume_slider.valueChanged.connect(self.on_volume_changed)
-        volume_layout.addWidget(self.volume_slider)
-        volume_label = QLabel("70%")
-        self.volume_label = volume_label
-        volume_layout.addWidget(volume_label)
-        layout.addLayout(volume_layout)
-
-        return panel
 
     def create_control_panel(self):
-        """Панель управления"""
+        """Универсальная панель управления"""
         panel = QWidget()
         panel.setStyleSheet("background-color: #2d2d2d; border-radius: 4px;")
         layout = QHBoxLayout(panel)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        # Кнопки воспроизведения/остановки
+        # Создаем кнопки (с иконками если доступно HAS_QTA)
         self.btn_play = self.create_icon_button('fa5s.play', '▶', 'Воспроизвести (Пробел)', self.play_selected)
         self.btn_stop = self.create_icon_button('fa5s.stop', '⏹', 'Стоп', self.stop_playback)
 
@@ -793,29 +768,34 @@ class MPVPlayer(QMainWindow):
         layout.addStretch()
 
         # Ползунок громкости
-        volume_layout = QHBoxLayout()
-        volume_layout.addWidget(QLabel("🔊"))
-        self.volume_slider = QSlider(Qt.Horizontal)
-        self.volume_slider.setMinimum(0)
-        self.volume_slider.setMaximum(100)
-        self.volume_slider.setValue(70)  # Значение по умолчанию
-        self.volume_slider.setFixedWidth(150)
-        self.volume_slider.setToolTip("Громкость")
-        self.volume_slider.valueChanged.connect(self.on_volume_changed)
-        volume_layout.addWidget(self.volume_slider)
-        volume_label = QLabel("70%")
-        self.volume_label = volume_label
-        volume_layout.addWidget(volume_label)
-        layout.addLayout(volume_layout)
+        self._create_volume_control(layout)
 
         self.btn_fullscreen = self.create_icon_button('fa5s.expand-arrows-alt', '⛶', 'Полноэкранный режим (F11 или двойной клик)', self.toggle_fullscreen)
         layout.addWidget(self.btn_fullscreen)
 
         return panel
+    
+    def _create_volume_control(self, parent_layout):
+        """Создание контрола громкости"""
+        volume_layout = QHBoxLayout()
+        volume_layout.addWidget(QLabel("🔊"))
+        
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(VOLUME_MIN, VOLUME_MAX)
+        self.volume_slider.setValue(VOLUME_DEFAULT)
+        self.volume_slider.setFixedWidth(VOLUME_SLIDER_WIDTH)
+        self.volume_slider.setToolTip("Громкость")
+        self.volume_slider.valueChanged.connect(self.on_volume_changed)
+        volume_layout.addWidget(self.volume_slider)
+        
+        self.volume_label = QLabel(f"{VOLUME_DEFAULT}%")
+        volume_layout.addWidget(self.volume_label)
+        
+        parent_layout.addLayout(volume_layout)
 
     @safe_call()
     def load_playlist(self, filepath):
-        """Загрузка плейлиста"""
+        """Загрузка плейлиста (оптимизированный)"""
         if not os.path.exists(filepath):
             print(f"Playlist not found: {filepath}")
             return
@@ -829,15 +809,16 @@ class MPVPlayer(QMainWindow):
 
         current_name, current_group, current_logo = None, None, None
 
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with open(filepath, 'r', encoding='utf-8', buffering=8192) as f:
             for line in f:
                 line = line.strip()
-                if not line:
+                if not line or line.startswith('#EXTM3U'):
                     continue
 
                 if line.startswith('#EXTINF'):
                     current_name, current_group, current_logo = parse_m3u_line(line)
                 elif not line.startswith('#') and current_name:
+                    # Создаем канал
                     channel = Channel(
                         name=current_name,
                         url=line,
@@ -848,12 +829,11 @@ class MPVPlayer(QMainWindow):
                     self.channels.append(channel)
                     self.categories[CATEGORY_ALL].append(channel)
 
+                    # Добавляем в категорию
                     if current_group:
-                        if current_group not in self.categories:
-                            self.categories[current_group] = []
-                        self.categories[current_group].append(channel)
+                        self.categories.setdefault(current_group, []).append(channel)
 
-                    current_name, current_group, current_logo = None, None, None
+                    current_name = None
 
         # Обновляем UI
         self.update_categories()
@@ -881,34 +861,34 @@ class MPVPlayer(QMainWindow):
         if "Все каналы" in self.categories:
             self.category_combo.setCurrentText("Все каналы")
 
-    def filter_channels(self):
-        """Фильтрация каналов по категории и поиску с отображением иконок"""
+    @safe_call()
+    def filter_channels(self, *args):
+        """Фильтрация каналов (оптимизированный с батчингом)"""
+        # Получаем категорию
+        category = self.category_combo.currentText()
+        if not category or category not in self.categories:
+            return
+
+        channels = self.categories[category]
+
+        # Применяем поиск
+        search_text = self.search_box.text().lower()
+        if search_text:
+            channels = [ch for ch in channels if search_text in ch.name.lower()]
+
+        # Блокируем сигналы для батчинга
+        self.channel_list.blockSignals(True)
         self.channel_list.clear()
 
-        try:
-            # Получаем категорию
-            category = self.category_combo.currentText()
-            if not category or category not in self.categories:
-                return
+        # Добавляем каналы батчем
+        for channel in channels:
+            item = QListWidgetItem(channel.name)
+            self.channel_list.addItem(item)
+            # Устанавливаем иконку (загружаем асинхронно или используем fallback)
+            self.get_channel_icon(channel.logo, channel.name, item)
 
-            channels = self.categories[category]
-
-            # Применяем поиск
-            search_text = self.search_box.text().lower()
-            if search_text:
-                channels = [ch for ch in channels if search_text in ch.name.lower()]
-
-            # Добавляем в список с иконками
-            for channel in channels:
-                item = QListWidgetItem(channel.name)
-                self.channel_list.addItem(item)
-
-                # Устанавливаем иконку (загружаем асинхронно или используем fallback)
-                self.get_channel_icon(channel.logo, channel.name, item)
-
-            self.info_label.setText(f"Показано каналов: {len(channels)} из {len(self.channels)}")
-        except Exception as e:
-            print(f"Error in filter_channels: {e}")
+        self.channel_list.blockSignals(False)
+        self.info_label.setText(f"Показано каналов: {len(channels)} из {len(self.channels)}")
 
     def on_channel_double_clicked(self, item):
         """Двойной клик по каналу"""
@@ -958,13 +938,11 @@ class MPVPlayer(QMainWindow):
             print(f"Error stopping: {e}")
 
     def get_channel_icon(self, logo_url, channel_name, list_item):
-        """Получить иконку канала (из кэша или добавить в очередь)"""
-        # Устанавливаем fallback сразу (быстро)
-        fallback_icon = self._create_fallback_icon()
-        list_item.setIcon(fallback_icon)
+        """Получить иконку канала (оптимизированный)"""
+        # Устанавливаем fallback сразу
+        list_item.setIcon(self._create_fallback_icon())
 
         if not logo_url:
-            # Нет URL логотипа - оставляем fallback
             return
 
         # Проверяем кэш
@@ -977,24 +955,27 @@ class MPVPlayer(QMainWindow):
         if logo_url in self.pending_icon_downloads:
             return
 
-        # Добавляем в очередь с небольшой задержкой для избежания падения
+        # Добавляем в очередь
         self.icon_download_queue.append({
             'url': logo_url,
             'name': channel_name,
             'item': list_item
         })
 
-        # Откладываем запуск очереди на 100мс, чтобы UI полностью инициализировался
-        # иначе может произойти падение при быстром выходе
-        QTimer.singleShot(100, self._process_download_queue)
+        # Запускаем очередь с задержкой только если она еще не запланирована
+        if not hasattr(self, '_icon_queue_timer_active') or not self._icon_queue_timer_active:
+            self._icon_queue_timer_active = True
+            QTimer.singleShot(ICON_DOWNLOAD_DELAY_MS, self._process_download_queue_with_reset)
 
+    def _process_download_queue_with_reset(self):
+        """Обработать очередь с сбросом флага таймера"""
+        self._icon_queue_timer_active = False
+        self._process_download_queue()
+    
     def _process_download_queue(self):
-        """Обработать очередь загрузок (запустить новые потоки, если можно)"""
-        # Проверяем, что self все еще существует (приложение может быть в процессе закрытия)
-        if not hasattr(self, 'pending_icon_downloads') or self._is_closing:
-            return
-
-        if not hasattr(self, 'icon_download_queue'):
+        """Обработать очередь загрузок (оптимизированный)"""
+        # Быстрая проверка на закрытие
+        if self._is_closing:
             return
 
         # Запускаем потоки, пока не достигнем лимита и пока есть очередь
@@ -1002,57 +983,44 @@ class MPVPlayer(QMainWindow):
                self.icon_download_queue):
             try:
                 item_data = self.icon_download_queue.pop(0)
-
-                # Повторная проверка
                 url = item_data['url']
+                
+                # Пропускаем если уже загружается или в кэше
                 if url in self.pending_icon_downloads or url in self.channel_icons:
                     continue
 
-                # Проверяем, что list_item все еще существует
+                # Проверяем валидность list_item
                 if not item_data['item']:
                     continue
 
+                # Создаем и запускаем поток загрузки
                 download_thread = ImageDownloadThread(url, item_data['name'])
-                # Надежное соединение с сохранением данных
                 download_thread.finished.connect(
                     lambda url, pixmap, item=item_data['item']: self._on_icon_loaded(url, pixmap, item)
                 )
 
-                # Сохраняем сильные ссылки
                 self.pending_icon_downloads[url] = download_thread
                 self._active_threads.append(download_thread)
-
-                # Запускаем
                 download_thread.start()
             except IndexError:
-                # Очередь пуста
                 break
 
     def _on_icon_loaded(self, url, pixmap, list_item):
-        """Обработчик загрузки иконки"""
-        # Проверяем, что self все еще существует и приложение не закрывается
-        if (not hasattr(self, 'pending_icon_downloads') or
-            self._is_closing or
-            not hasattr(self, '_process_download_queue')):
+        """Обработчик загрузки иконки (оптимизированный)"""
+        # Быстрая проверка на закрытие приложения
+        if self._is_closing:
             return
 
         # Удаляем из списка активных загрузок
-        if url in self.pending_icon_downloads:
-            del self.pending_icon_downloads[url]
+        self.pending_icon_downloads.pop(url, None)
 
         try:
-            # Проверяем, что объект list_item еще существует
-            # Дополнительная проверка через Sip API
+            # Проверяем валидность list_item
             if list_item is None:
                 return
 
-            # Проверяем, что это действительно QListWidgetItem
-            from PySide6.QtWidgets import QListWidgetItem
-            if not isinstance(list_item, QListWidgetItem):
-                return
-
+            # Устанавливаем иконку
             if pixmap and not pixmap.isNull():
-                # Создаем иконку из pixmap
                 icon = QIcon(pixmap)
                 self.channel_icons[url] = icon
                 list_item.setIcon(icon)
@@ -1065,19 +1033,14 @@ class MPVPlayer(QMainWindow):
                 self.icon_stats['failed'] += 1
         except (RuntimeError, AttributeError):
             # Объект list_item был удален (пользователь сменил категорию/поиск)
-            # Игнорируем ошибку
             pass
-        except Exception as e:
-            # Любая другая ошибка - тоже игнорируем
-            print(f"Warning: error setting icon (ignored): {e}")
         finally:
             # Запускаем следующую загрузку из очереди
-            if hasattr(self, '_process_download_queue') and not self._is_closing:
+            if not self._is_closing:
                 self._process_download_queue()
 
             # Выводим статистику, когда все загрузки завершены
-            if (hasattr(self, 'icon_stats') and
-                not self.pending_icon_downloads and
+            if (not self.pending_icon_downloads and
                 not self.icon_download_queue and
                 (self.icon_stats['loaded'] + self.icon_stats['failed']) > 0):
                 print(f"Icon loading complete: {self.icon_stats['loaded']} loaded, "
@@ -1085,20 +1048,25 @@ class MPVPlayer(QMainWindow):
                 self.icon_stats = {'loaded': 0, 'failed': 0, 'cache': 0}
 
     def _create_fallback_icon(self):
-        """Создать fallback иконку для каналов без логотипа"""
+        """Создать fallback иконку для каналов без логотипа (с кэшем)"""
+        # Используем кэшированную версию если уже создана
+        if self._fallback_icon is not None:
+            return self._fallback_icon
+        
         # Создаем простую иконку с буквой "TV"
-        pixmap = QPixmap(32, 32)
+        pixmap = QPixmap(CHANNEL_ICON_SIZE, CHANNEL_ICON_SIZE)
         pixmap.fill(QColor("transparent"))
 
         from PySide6.QtGui import QPainter, QFont
 
         painter = QPainter(pixmap)
-        painter.setPen(QColor("#4080b0"))
+        painter.setPen(QColor(COLORS['accent']))
         painter.setFont(QFont("Arial", 8))
         painter.drawText(pixmap.rect(), Qt.AlignCenter, "TV")
         painter.end()
 
-        return QIcon(pixmap)
+        self._fallback_icon = QIcon(pixmap)
+        return self._fallback_icon
 
     def _create_playlist_control_buttons(self):
         """Создать кнопки управления плейлистом (обновить, удалить)"""
@@ -1175,31 +1143,30 @@ class MPVPlayer(QMainWindow):
             return self.playlists_data[playlist_file].get('name', playlist_file)
         return os.path.basename(playlist_file)
 
+    @safe_call()
     def _update_playlist_controls(self, playlist_file):
         """Обновление состояния управляющих элементов плейлиста"""
-        if not hasattr(self, 'btn_update_playlist'):
-            return
+        # Кнопка обновления теперь всегда доступна
+        if playlist_file and playlist_file in self.playlists_data:
+            if 'url' in self.playlists_data[playlist_file]:
+                url = self.playlists_data[playlist_file]['url']
+                self.btn_update_playlist.setToolTip(f"Обновить из URL:\n{url}")
+            else:
+                self.btn_update_playlist.setToolTip(f"Перезагрузить плейлист из файла:\n{playlist_file}")
+    
+    def on_auto_update_changed(self, state):
+        """Обработчик изменения чекбокса автообновления"""
+        self.auto_update_enabled = bool(state)
+        self.save_playlists_data()
+        status = "включено" if self.auto_update_enabled else "отключено"
+        print(f"Auto-update {status}")
+        self.status_label.setText(f"Автообновление {status}")
 
-        # Кнопка обновления - включается только для URL-плейлистов
-        if playlist_file and playlist_file in self.playlists_data and 'url' in self.playlists_data[playlist_file]:
-            self.btn_update_playlist.setEnabled(True)
-            url = self.playlists_data[playlist_file]['url']
-            self.btn_update_playlist.setToolTip(f"Обновить из URL\n{url}")
-        else:
-            self.btn_update_playlist.setEnabled(False)
-            self.btn_update_playlist.setToolTip("Обновить плейлист (доступно только для URL-плейлистов)")
-
+    @safe_call()
     def on_playlist_changed(self, playlist_name):
-        """Обработка изменения выбранного плейлиста"""
+        """Обработка изменения выбранного плейлиста (оптимизированный)"""
         # Пропускаем обработку во время инициализации UI
-        if getattr(self, 'initializing_ui', False):
-            return
-
-        if not playlist_name:
-            return
-
-        # Проверяем, что UI полностью инициализирован
-        if not hasattr(self, 'status_label'):
+        if self.initializing_ui or not playlist_name:
             return
 
         # Находим соответствующий файл
@@ -1209,18 +1176,16 @@ class MPVPlayer(QMainWindow):
         if playlist_file:
             self.last_playlist = playlist_file
             self.save_playlists_data()
+            self._update_playlist_controls(playlist_file)
 
-        # Обновляем управляющие элементы
-        self._update_playlist_controls(playlist_file)
-
-        # Загружаем плейлист
-        if playlist_file and os.path.exists(playlist_file):
-            print(f"Loading playlist: {playlist_file}")
-            self.load_playlist(playlist_file)
-            display_name = self._find_playlist_display_name(playlist_file)
-            self.status_label.setText(f"Загружен плейлист: {display_name}")
-        else:
-            self.status_label.setText(f"Файл плейлиста не найден: {playlist_name}")
+            # Загружаем плейлист
+            if os.path.exists(playlist_file):
+                print(f"Loading playlist: {playlist_file}")
+                self.load_playlist(playlist_file)
+                display_name = self._find_playlist_display_name(playlist_file)
+                self.status_label.setText(f"Загружен плейлист: {display_name}")
+            else:
+                self.status_label.setText(f"Файл плейлиста не найден: {playlist_name}")
 
     def on_update_playlist_clicked(self):
         """Обработка нажатия кнопки обновления плейлиста"""
@@ -1231,23 +1196,45 @@ class MPVPlayer(QMainWindow):
 
         # Ищем имя файла по отображаемому имени
         playlist_file = self._find_playlist_file_by_display_name(current_display_name)
-
-        if not playlist_file or playlist_file not in self.playlists_data or 'url' not in self.playlists_data[playlist_file]:
-            QMessageBox.warning(self, "Предупреждение", "Этот плейлист нельзя обновить (отсутствует URL)")
+        
+        if not playlist_file or playlist_file not in self.playlists_data:
+            QMessageBox.warning(self, "Предупреждение", "Плейлист не найден")
             return
 
-        # Запрашиваем подтверждение
-        url = self.playlists_data[playlist_file]['url']
         display_name = self._find_playlist_display_name(playlist_file)
-        reply = QMessageBox.question(
-            self,
-            "Подтверждение",
-            f"Обновить плейлист '{display_name}' из:\n{url}",
-            QMessageBox.Yes | QMessageBox.No
-        )
-
-        if reply == QMessageBox.Yes:
-            self.update_playlist_from_url(playlist_file)
+        
+        # Проверяем, есть ли URL для обновления
+        if 'url' in self.playlists_data[playlist_file]:
+            # Плейлист с URL - загружаем заново
+            url = self.playlists_data[playlist_file]['url']
+            reply = QMessageBox.question(
+                self,
+                "Подтверждение",
+                f"Обновить плейлист '{display_name}' из URL:\n{url}",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                self.update_playlist_from_url(playlist_file)
+        else:
+            # Локальный файл - просто перезагружаем
+            reply = QMessageBox.question(
+                self,
+                "Подтверждение",
+                f"Перезагрузить плейлист '{display_name}' из файла:\n{playlist_file}",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                if os.path.exists(playlist_file):
+                    self.load_playlist(playlist_file)
+                    # Обновляем timestamp
+                    self.playlists_data[playlist_file]['last_updated'] = time.time()
+                    self.save_playlists_data()
+                    self.status_label.setText(f"Плейлист перезагружен: {display_name}")
+                    QMessageBox.information(self, "Успех", f"Плейлист '{display_name}' успешно перезагружен!")
+                else:
+                    QMessageBox.warning(self, "Ошибка", f"Файл не найден: {playlist_file}")
 
     def on_delete_playlist_clicked(self):
         """Обработка нажатия кнопки удаления плейлиста"""
@@ -1300,39 +1287,46 @@ class MPVPlayer(QMainWindow):
                 print(f"Error deleting playlist: {e}")
                 QMessageBox.critical(self, "Ошибка", f"Не удалось удалить плейлист:\n{e}")
 
+    @safe_call()
     def on_volume_changed(self, value):
-        """Обработка изменения громкости"""
-        # Проверяем, что UI полностью инициализирован
-        if not hasattr(self, 'volume_label'):
+        """Обработка изменения громкости (оптимизированный)"""
+        if self.initializing_ui:
             return
+        
+        self.player.volume = value
+        self.volume_label.setText(f"{value}%")
 
-        try:
-            # ПРОСТОЕ ПРЯМОЕ ОБРАЩЕНИЕ К MPV (как в старой версии)
-            self.player.volume = value
-            self.volume_label.setText(f"{value}%")
-        except Exception as e:
-            print(f"Error setting volume: {e}")
-
+    @safe_call()
     def load_playlists_data(self):
-        """Загрузка данных плейлистов из JSON"""
-        if os.path.exists("playlists.json"):
-            try:
-                with open("playlists.json", 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.playlists_data = data.get('playlists', {})
-                    self.last_playlist = data.get('last_playlist', None)
-                print(f"Loaded {len(self.playlists_data)} playlists metadata from JSON")
-                print(f"Last playlist: {self.last_playlist}")
-            except Exception as e:
-                print(f"Error loading playlists.json: {e}")
-                self.playlists_data = {}
-                self.last_playlist = None
-        else:
+        """Загрузка данных плейлистов из JSON (оптимизированный)"""
+        if not os.path.exists(PLAYLISTS_JSON):
             self.playlists_data = {}
             self.last_playlist = None
+            self.auto_update_enabled = True
+            return
+        
+        try:
+            with open(PLAYLISTS_JSON, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                self.playlists_data = data.get('playlists', {})
+                self.last_playlist = data.get('last_playlist', None)
+                self.auto_update_enabled = data.get('auto_update_enabled', True)
+            print(f"Loaded {len(self.playlists_data)} playlists metadata from JSON")
+            print(f"Last playlist: {self.last_playlist}")
+            print(f"Auto-update enabled: {self.auto_update_enabled}")
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Error loading playlists.json: {e}")
+            self.playlists_data = {}
+            self.last_playlist = None
+            self.auto_update_enabled = True
 
     def check_and_update_playlists_on_startup(self):
         """Проверка и обновление плейлистов при запуске"""
+        # Проверяем, включено ли автообновление
+        if not self.auto_update_enabled:
+            print("Auto-update is disabled, skipping playlist check")
+            return
+        
         if not self.playlists_data:
             return
 
@@ -1343,7 +1337,7 @@ class MPVPlayer(QMainWindow):
         for playlist_name, data in self.playlists_data.items():
             if 'url' in data:
                 last_updated = data.get('last_updated', 0)
-                if current_time - last_updated > 86400:  # 24 часа в секундах
+                if current_time - last_updated > PLAYLIST_UPDATE_INTERVAL:
                     needs_update.append(playlist_name)
 
         if needs_update:
@@ -1356,22 +1350,37 @@ class MPVPlayer(QMainWindow):
             )
 
             if reply == QMessageBox.Yes:
-                for playlist_name in needs_update:
-                    print(f"Auto-updating playlist: {playlist_name}")
-                    self.update_playlist_from_url(playlist_name)
+                # Сохраняем очередь обновлений и запускаем первый
+                self.update_queue = needs_update.copy()
+                if self.update_queue:
+                    self._update_next_playlist_in_queue()
 
+    def _update_next_playlist_in_queue(self):
+        """Обновить следующий плейлист из очереди"""
+        # Проверяем, не закрывается ли приложение
+        if self._is_closing:
+            return
+        
+        if not hasattr(self, 'update_queue') or not self.update_queue:
+            print("All playlists updated successfully!")
+            return
+        
+        # Берем первый плейлист из очереди
+        playlist_name = self.update_queue.pop(0)
+        print(f"Auto-updating playlist ({len(self.update_queue)} remaining): {playlist_name}")
+        self.update_playlist_from_url(playlist_name)
+
+    @safe_call()
     def save_playlists_data(self):
-        """Сохранение данных плейлистов в JSON"""
-        try:
-            data = {
-                'playlists': self.playlists_data,
-                'last_playlist': self.last_playlist
-            }
-            with open("playlists.json", 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            print("Saved playlists metadata to playlists.json")
-        except Exception as e:
-            print(f"Error saving playlists.json: {e}")
+        """Сохранение данных плейлистов в JSON (оптимизированный)"""
+        data = {
+            'playlists': self.playlists_data,
+            'last_playlist': self.last_playlist,
+            'auto_update_enabled': self.auto_update_enabled
+        }
+        with open(PLAYLISTS_JSON, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print("Saved playlists metadata to playlists.json")
 
     def update_playlist_from_url(self, playlist_name):
         """Обновление плейлиста из URL в JSON файле"""
@@ -1385,6 +1394,11 @@ class MPVPlayer(QMainWindow):
         self.status_label.setText(f"Обновление плейлиста: {playlist_name}...")
         self.progress_bar.setVisible(True)
 
+        # Останавливаем предыдущий поток, если он еще работает
+        if self.download_thread and self.download_thread.isRunning():
+            self.download_thread.stop()
+            self.download_thread.wait(1000)
+
         # Скачиваем
         self.download_thread = PlaylistDownloadThread(playlist_data['url'], playlist_name)
         self.download_thread.finished.connect(
@@ -1395,6 +1409,10 @@ class MPVPlayer(QMainWindow):
 
     def on_playlist_updated(self, success, error, playlist_name):
         """Обработка обновленного плейлиста"""
+        # Проверяем, не закрывается ли приложение
+        if self._is_closing:
+            return
+        
         self.progress_bar.setVisible(False)
 
         if success:
@@ -1412,10 +1430,30 @@ class MPVPlayer(QMainWindow):
             else:
                 self.status_label.setText(f"Плейлист обновлён: {playlist_name}")
 
-            QMessageBox.information(self, "Успех", f"Плейлист '{display_name}' успешно обновлён!")
+            # Проверяем, есть ли еще плейлисты в очереди на обновление
+            if hasattr(self, 'update_queue') and self.update_queue:
+                # Есть еще плейлисты - запускаем следующий
+                self._update_next_playlist_in_queue()
+            else:
+                # Это было ручное обновление или последний плейлист в очереди
+                QMessageBox.information(self, "Успех", f"Плейлист '{display_name}' успешно обновлён!")
         else:
             self.status_label.setText(f"Ошибка обновления: {error}")
-            QMessageBox.critical(self, "Ошибка", f"Не удалось обновить плейлист:\n{error}")
+            
+            # Проверяем, есть ли еще плейлисты в очереди
+            if hasattr(self, 'update_queue') and self.update_queue:
+                # Продолжаем обновление несмотря на ошибку
+                reply = QMessageBox.critical(
+                    self, "Ошибка", 
+                    f"Не удалось обновить плейлист '{playlist_name}':\n{error}\n\nПродолжить обновление других плейлистов?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    self._update_next_playlist_in_queue()
+                else:
+                    self.update_queue.clear()
+            else:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось обновить плейлист:\n{error}")
 
     def update_playlist_list(self):
         """Обновление списка доступных плейлистов"""
@@ -1437,91 +1475,55 @@ class MPVPlayer(QMainWindow):
             else:
                 self.playlist_combo.setCurrentIndex(0)
 
+    @safe_call()
     def toggle_fullscreen(self):
-        """
-        Переключение полноэкранного режима через Qt
-        Используем Qt для управления окном вместо MPV
-        """
+        """Переключение полноэкранного режима (оптимизированный)"""
         if not self.current_channel:
             QMessageBox.information(self, "Информация", "Сначала выберите канал для воспроизведения")
             return
 
         # Защита от множественных вызовов
         current_time = time.time()
-        if self.is_toggling_fullscreen or (current_time - self.last_fullscreen_toggle) < 0.5:
-            print("Already toggling fullscreen or too soon, ignoring...")
+        if self.is_toggling_fullscreen or (current_time - self.last_fullscreen_toggle) < TOGGLE_FULLSCREEN_DELAY:
             return
 
-        try:
-            self.is_toggling_fullscreen = True
-            self.last_fullscreen_toggle = current_time
+        self.is_toggling_fullscreen = True
+        self.last_fullscreen_toggle = current_time
 
-            if not self.is_fullscreen:
-                # Входим в полноэкранный режим
-                print("Entering fullscreen mode...")
-                self.is_fullscreen = True
+        # Список элементов для переключения видимости
+        ui_elements = [
+            self.main_menubar, self.left_panel, self.channel_name_label,
+            self.control_panel, self.progress_bar, self.playlist_combo,
+            self.btn_update_playlist, self.btn_delete_playlist, self.playlist_label,
+            self.auto_update_checkbox
+        ]
 
-                # Скрываем элементы UI
-                self.main_menubar.hide()
-                self.left_panel.hide()
-                self.channel_name_label.hide()
-                self.control_panel.hide()
-                self.progress_bar.hide()
+        if not self.is_fullscreen:
+            # Входим в полноэкранный режим
+            print("Entering fullscreen mode...")
+            self.is_fullscreen = True
+            
+            for element in ui_elements:
+                element.hide()
+            
+            self.right_layout.setContentsMargins(0, 0, 0, 0)
+            self.showFullScreen()
+            self.status_label.setText("Полноэкранный режим (ESC или F11 для выхода)")
+        else:
+            # Выходим из полноэкранного режима
+            print("Exiting fullscreen mode...")
+            self.is_fullscreen = False
+            
+            self.showNormal()
+            
+            for element in ui_elements:
+                element.show()
+            
+            self.right_layout.setContentsMargins(8, 8, 8, 8)
+            self.status_label.setText(f"Воспроизводится: {self.current_channel}")
 
-                # Скрываем управление плейлистом
-                if hasattr(self, 'playlist_combo'):
-                    self.playlist_combo.hide()
-                if hasattr(self, 'btn_update_playlist'):
-                    self.btn_update_playlist.hide()
-                if hasattr(self, 'btn_delete_playlist'):
-                    self.btn_delete_playlist.hide()
-                if hasattr(self, 'playlist_label'):
-                    self.playlist_label.hide()
-
-                # Растягиваем видео фрейм
-                self.right_layout.setContentsMargins(0, 0, 0, 0)
-
-                # Переходим в полноэкранный режим Qt
-                self.showFullScreen()
-
-                self.status_label.setText("Полноэкранный режим (ESC или F11 для выхода)")
-
-            else:
-                # Выходим из полноэкранного режима
-                print("Exiting fullscreen mode...")
-                self.is_fullscreen = False
-
-                # Возвращаем нормальное окно
-                self.showNormal()
-
-                # Показываем элементы UI
-                self.main_menubar.show()
-                self.left_panel.show()
-                self.channel_name_label.show()
-                self.control_panel.show()
-
-                # Показываем управление плейлистом
-                if hasattr(self, 'playlist_combo'):
-                    self.playlist_combo.show()
-                if hasattr(self, 'btn_update_playlist'):
-                    self.btn_update_playlist.show()
-                if hasattr(self, 'btn_delete_playlist'):
-                    self.btn_delete_playlist.show()
-                if hasattr(self, 'playlist_label'):
-                    self.playlist_label.show()
-
-                # Восстанавливаем отступы
-                self.right_layout.setContentsMargins(8, 8, 8, 8)
-
-                self.status_label.setText(f"Воспроизводится: {self.current_channel}")
-
-            # Сбрасываем флаг через 500мс
-            QTimer.singleShot(500, self._reset_fullscreen_flag)
-
-        except Exception as e:
-            self.is_toggling_fullscreen = False
-            print(f"Error toggling fullscreen: {e}")
-            QMessageBox.warning(self, "Ошибка", f"Не удалось переключить режим:\n{e}")
+        # Сбрасываем флаг через 500мс
+        QTimer.singleShot(500, self._reset_fullscreen_flag)
 
     def _reset_fullscreen_flag(self):
         """Сброс флага переключения полноэкранного режима"""
@@ -1723,6 +1725,11 @@ class MPVPlayer(QMainWindow):
         # Сохраняем имя плейлиста для использования в колбэке
         self.pending_playlist_name = playlist_name
 
+        # Останавливаем предыдущий поток, если он еще работает
+        if self.download_thread and self.download_thread.isRunning():
+            self.download_thread.stop()
+            self.download_thread.wait(1000)
+
         # Скачиваем
         self.download_thread = PlaylistDownloadThread(url, "downloaded.m3u")
         self.download_thread.finished.connect(
@@ -1805,19 +1812,31 @@ class MPVPlayer(QMainWindow):
 
     @safe_call()
     def closeEvent(self, event):
-        """При закрытии приложения"""
+        """При закрытии приложения (оптимизированный)"""
         print("Cleaning up before exit...")
         self._is_closing = True
+
+        # Очищаем очередь автообновления
+        if hasattr(self, 'update_queue'):
+            self.update_queue.clear()
+
+        # Останавливаем загрузку плейлиста
+        if self.download_thread and self.download_thread.isRunning():
+            self.download_thread.stop()
+            self.download_thread.wait(1000)  # Ждем максимум 1 секунду
 
         # Останавливаем загрузку иконок
         self._cleanup_channels_and_threads()
 
+        # Ждем завершения потоков иконок
+        for thread in self._active_threads:
+            if thread.isRunning():
+                thread.stop()
+                thread.wait(500)  # Ждем максимум 0.5 секунды
+
         # Закрываем MPV
-        try:
-            if hasattr(self, 'player'):
-                self.player.terminate()
-        except Exception as e:
-            print(f"Error terminating MPV: {e}")
+        if hasattr(self, 'player'):
+            self.player.terminate()
 
         event.accept()
 
