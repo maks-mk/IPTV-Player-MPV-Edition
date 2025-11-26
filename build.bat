@@ -1,1 +1,1 @@
-pyinstaller --onefile --windowed --icon=maksiptv.ico --name=MaksIPTV main_mpv.py
+pyinstaller --onefile --windowed --icon=iptv.ico --name=MaksIPTV main_mpv.py
